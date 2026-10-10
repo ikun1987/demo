@@ -68,10 +68,13 @@ export function loadModel(onProgress = () => {}) {
   loading = (async () => {
     const o = await loadOrt();
     onProgress(0.02, '准备运行时…');
-    let lastErr = null;
-    for (const url of modelUrls()) {
+    const urls = modelUrls();
+    const errs = [];
+    for (let i = 0; i < urls.length; i++) {
+      const url = urls[i];
+      const host = (() => { try { return new URL(url, location.href).host || '本地'; } catch { return '本地'; } })();
       try {
-        // 先用 fetch 拿到 ArrayBuffer，这样能报告下载进度
+        if (i > 0) onProgress(0.05, `换源重试（${host}）…`);
         const buf = await fetchWithProgress(url, (p) => onProgress(0.05 + p * 0.85, '下载模型…'));
         onProgress(0.92, '初始化会话…');
         const providers = [];
@@ -90,13 +93,22 @@ export function loadModel(onProgress = () => {}) {
           });
         }
         onProgress(1, '就绪');
+        // 记录成功来源，排障时一眼能看出走的是哪个源
+        try { window.__LAMA_SOURCE__ = host; } catch (e) { /* ignore */ }
+        console.log(`[lama] 模型加载成功，来源=${host}，${(buf.byteLength / 1048576).toFixed(1)}MB`);
         return session;
       } catch (e) {
-        lastErr = e;
+        const msg = `${host}: ${e?.message || e}`;
+        errs.push(msg);
+        console.warn('[lama] 模型源失败 →', msg);
       }
     }
     loading = null;
-    throw lastErr || new Error('模型加载失败');
+    // 把每个源失败的原因都带出来，方便定位（否则用户只看到"连接超时"一头雾水）
+    const detail = errs.join('；');
+    const err = new Error(`模型下载失败，已尝试 ${urls.length} 个源。原因：${detail}`);
+    err.sources = errs;
+    throw err;
   })();
   return loading;
 }
@@ -104,18 +116,24 @@ export function loadModel(onProgress = () => {}) {
 /**
  * 带进度与**超时**的下载。
  *
- * 超时很重要：实测大陆直连 huggingface.co 会一直卡到 TCP 超时（21 秒以上），
- * 不加超时的话用户要干等半分钟才轮到镜像。这里把「首字节」和「整体」都限时。
+ * 超时参数怎么定的（实测）：
+ *  · 镜像解析 + 302 跳 CDN 约 4.4 秒，再叠加 TLS 握手与手机弱网，
+ *    首字节给到 45 秒都不算多 —— 曾用 8 秒，结果用户直接看到"连接超时"。
+ *  · 首字节到达后，只要还在持续收数据就不该判超时，所以整体超时给得很宽（10 分钟）。
  */
-async function fetchWithProgress(url, onProgress, { firstByteMs = 8000, totalMs = 300000 } = {}) {
+async function fetchWithProgress(url, onProgress, { firstByteMs = 45000, totalMs = 600000 } = {}) {
   const ac = new AbortController();
-  let firstByteTimer = setTimeout(() => ac.abort(new Error('连接超时')), firstByteMs);
+  const firstByteTimer = setTimeout(() => ac.abort(new Error('连接超时')), firstByteMs);
   const hardTimer = setTimeout(() => ac.abort(new Error('下载超时')), totalMs);
   try {
-    const res = await fetch(url, { signal: ac.signal, mode: 'cors' });
-    if (!res.ok) throw new Error(`模型下载失败 HTTP ${res.status}`);
+    const res = await fetch(url, { signal: ac.signal, mode: 'cors', credentials: 'omit' });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const total = Number(res.headers.get('content-length') || 0);
-    if (!res.body || !total) return new Uint8Array(await res.arrayBuffer());
+    if (!res.body) {
+      const buf = await res.arrayBuffer();
+      if (!buf.byteLength) throw new Error('响应为空');
+      return new Uint8Array(buf);
+    }
     const reader = res.body.getReader();
     const chunks = [];
     let received = 0;
@@ -126,8 +144,11 @@ async function fetchWithProgress(url, onProgress, { firstByteMs = 8000, totalMs 
       if (first) { clearTimeout(firstByteTimer); first = false; }
       chunks.push(value);
       received += value.length;
-      onProgress(Math.min(1, received / total));
+      onProgress(total ? Math.min(1, received / total) : 0.5);
     }
+    if (!received) throw new Error('响应为空');
+    // 模型至少几十 MB，太小的响应基本是错误页
+    if (received < 1024 * 1024) throw new Error(`文件过小（${received} 字节）`);
     const out = new Uint8Array(received);
     let off = 0;
     for (const c of chunks) { out.set(c, off); off += c.length; }

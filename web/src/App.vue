@@ -83,14 +83,31 @@
         <div class="card" v-if="resultUrl">
           <div class="result-actions">
             <button class="btn primary" @click="download">⬇︎ 保存到相册</button>
-            <button class="btn" @click="doProcess">↻ 再处理一次</button>
+            <button class="btn" @click="doProcess">↻ 再修一次</button>
           </div>
+
+          <!-- AI 深度修复升级（可选，需要下载模型） -->
+          <div v-if="engine === 'fast'" class="upgrade">
+            <div class="upgrade-head">
+              <span class="tag">快修版</span>
+              <button class="btn ai" :disabled="busy" @click="refineWithAI">
+                {{ busy ? 'AI 处理中…' : '✨ 用 AI 深度修复' }}
+              </button>
+            </div>
+            <div class="hint" style="margin-top:8px">
+              已经能用了。若背景纹理复杂、边缘有轻微模糊，点上面这个按钮，
+              首次会下载约 60MB 的 AI 模型（建议 Wi-Fi），效果更干净。
+            </div>
+          </div>
+          <div v-else-if="engine === 'lama'" class="tip" style="margin-top:10px">
+            ✨ 已完成 <b>AI 深度修复</b>（LaMa 重建背景）
+          </div>
+
           <div class="tip">
             📱 <b>手机上保存：</b>长按上方结果图 → 选「存储图像 / 保存图片」。
             若长按没反应，点「保存到相册」按钮；iPhone 上用 Safari 打开效果最好。
           </div>
           <div class="result-actions" style="margin-top:10px">
-            <button class="btn" @click="download" v-if="isIOS">🖼 在新页打开</button>
             <button class="btn" @click="reset">选另一张</button>
           </div>
         </div>
@@ -149,6 +166,7 @@
 import { ref, computed, onMounted, onBeforeUnmount, nextTick } from 'vue';
 import { buildMask } from './lib/detect.js';
 import { loadModel, inpaint, mergeByMask } from './lib/lama.js';
+import { fastInpaint } from './lib/fastinpaint.js';
 
 const fileRef = ref(null);
 const wrapRef = ref(null);
@@ -160,6 +178,10 @@ const srcImage = ref(null);       // HTMLImageElement
 const srcData = ref(null);        // ImageData
 const resultData = ref(null);     // ImageData
 const resultUrl = ref('');
+const resultBlobUrl = ref('');    // 结果图的 Blob URL（长按保存用）
+const resultBlob = ref(null);
+const engine = ref('');           // 'fast' | 'lama'
+const usedMask = ref(null);       // 本次处理用的掩膜（供 AI 升级复用）
 const maskPx = ref(0);
 const strength = ref(4);
 const brushMode = ref(false);
@@ -404,6 +426,13 @@ function toggleBrush() {
 }
 
 /* ---------------- 主流程 ---------------- */
+/**
+ * 两段式处理：
+ *   ① 快修（fastinpaint）：纯本地，**无需下载任何东西**，1 秒内出结果。
+ *      保证任何网络环境下都能拿到成品 —— 这是可用性底线。
+ *   ② AI 深度修复（LaMa，需下 59MB 模型）：可选升级，复杂背景/硬边效果更好。
+ * 这样"网络不好"再也不会变成"什么都拿不到"。
+ */
 async function doProcess() {
   if (!srcData.value || busy.value) return;
   busy.value = true;
@@ -414,6 +443,8 @@ async function doProcess() {
     const W = src.width, H = src.height;
     let mask = customMask.value;
     if (!mask) {
+      stageText.value = '识别水印…';
+      await new Promise((r) => setTimeout(r, 20));
       const r = buildMask(src, { strength: strength.value });
       if (!r) {
         busy.value = false;
@@ -424,69 +455,137 @@ async function doProcess() {
       maskPx.value = r.info.maskPx;
     }
 
-    stageText.value = '加载 AI 模型…';
-    progress.value = 0.05;
-    await loadModel((p, msg) => { progress.value = 0.05 + p * 0.45; stageText.value = msg; });
-
-    stageText.value = 'AI 修复中…';
-    progress.value = 0.55;
-    // 提取 RGB（0..255 浮点）
+    // 提取 RGB
     const rgb = new Float32Array(W * H * 3);
     for (let i = 0, p = 0; i < W * H; i++, p += 4) {
       rgb[i * 3] = src.data[p];
       rgb[i * 3 + 1] = src.data[p + 1];
       rgb[i * 3 + 2] = src.data[p + 2];
     }
-    await new Promise((r) => setTimeout(r, 30));   // 让 UI 先刷新
 
-    const patched = await inpaint({ width: W, height: H }, rgb, mask);
-    progress.value = 0.9;
-    const merged = mergeByMask({ width: W, height: H }, rgb, patched, mask, 1.0);
+    stageText.value = '快速修复中…';
+    progress.value = 0.3;
+    await new Promise((r) => setTimeout(r, 20));
+    const { rgb: fastOut, ms } = fastInpaint({ width: W, height: H }, rgb, mask);
+    console.log(`[fast] 快修完成 ${ms.toFixed(0)}ms`);
 
-    const out = new ImageData(W, H);
-    for (let i = 0, p = 0; i < W * H; i++, p += 4) {
-      out.data[p] = Math.max(0, Math.min(255, merged[i * 3]));
-      out.data[p + 1] = Math.max(0, Math.min(255, merged[i * 3 + 1]));
-      out.data[p + 2] = Math.max(0, Math.min(255, merged[i * 3 + 2]));
-      out.data[p + 3] = 255;
-    }
-    resultData.value = out;
-    // 生成可长按保存的 PNG dataURL
-    const cv = document.createElement('canvas');
-    cv.width = W; cv.height = H;
-    cv.getContext('2d').putImageData(out, 0, 0);
-    resultUrl.value = cv.toDataURL('image/png');
-    splitPct.value = 50;
+    await commitResult(fastOut, W, H);
+    engine.value = 'fast';
+    usedMask.value = mask;
     progress.value = 1;
     stageText.value = '完成';
-    await nextTick();
-    draw();
-    bindLongPressGuide();
-    tip('已完成！长按结果图即可保存到相册');
+    tip('已修好！长按图片保存 · 觉得不够干净可点「AI 深度修复」');
   } catch (e) {
-    console.error(e);
-    tip(`处理失败：${e?.message || e}`);
+    reportError(e, '处理');
   } finally {
     busy.value = false;
   }
 }
 
+/** 用 AI（LaMa）再修一次，效果更好但需要下载模型 */
+async function refineWithAI() {
+  if (!srcData.value || busy.value) return;
+  const src = srcData.value;
+  const W = src.width, H = src.height;
+  const mask = usedMask.value || customMask.value;
+  if (!mask) { tip('请先处理一次或手动涂抹水印区域'); return; }
+  busy.value = true;
+  progress.value = 0;
+  stageText.value = '准备 AI 模型…';
+  try {
+    await loadModel((p, msg) => { progress.value = p * 0.6; stageText.value = msg; });
+    stageText.value = 'AI 修复中…';
+    progress.value = 0.65;
+    await new Promise((r) => setTimeout(r, 20));
+
+    const rgb = new Float32Array(W * H * 3);
+    for (let i = 0, p = 0; i < W * H; i++, p += 4) {
+      rgb[i * 3] = src.data[p];
+      rgb[i * 3 + 1] = src.data[p + 1];
+      rgb[i * 3 + 2] = src.data[p + 2];
+    }
+    const patched = await inpaint({ width: W, height: H }, rgb, mask);
+    progress.value = 0.92;
+    const merged = mergeByMask({ width: W, height: H }, rgb, patched, mask, 1.0);
+    await commitResult(merged, W, H);
+    engine.value = 'lama';
+    progress.value = 1;
+    stageText.value = '完成';
+    tip('AI 深度修复完成');
+  } catch (e) {
+    // AI 失败不影响已有结果：明确告诉用户快修版仍然可用
+    console.error(e);
+    tip(`AI 修复失败（${e?.message || e}）。上面这份是快修版，仍然可以保存`, 6000);
+  } finally {
+    busy.value = false;
+  }
+}
+
+/** 把结果写进界面：转 ImageData → Blob URL → 触发重绘 */
+async function commitResult(floatRgb, W, H) {
+  const out = new ImageData(W, H);
+  for (let i = 0, p = 0; i < W * H; i++, p += 4) {
+    out.data[p] = Math.max(0, Math.min(255, floatRgb[i * 3]));
+    out.data[p + 1] = Math.max(0, Math.min(255, floatRgb[i * 3 + 1]));
+    out.data[p + 2] = Math.max(0, Math.min(255, floatRgb[i * 3 + 2]));
+    out.data[p + 3] = 255;
+  }
+  resultData.value = out;
+  // 用 Blob URL 而不是 dataURL：iOS Safari 对 dataURL 有长度限制
+  // （大图 base64 动辄 2~4MB 会被拒绝），Blob URL 没这个问题，
+  // 而且长按保存、下载、新窗口打开三种路径都更稳。
+  const cv = document.createElement('canvas');
+  cv.width = W; cv.height = H;
+  cv.getContext('2d').putImageData(out, 0, 0);
+  const blob = await new Promise((res) => cv.toBlob(res, 'image/png'));
+  if (resultBlobUrl.value) URL.revokeObjectURL(resultBlobUrl.value);
+  resultBlobUrl.value = blob ? URL.createObjectURL(blob) : cv.toDataURL('image/png');
+  resultBlob.value = blob;
+  resultUrl.value = resultBlobUrl.value;
+  splitPct.value = 50;
+  await nextTick();
+  draw();
+  bindLongPressGuide();
+}
+
 function download() {
   if (!resultUrl.value) return;
-  const a = document.createElement('a');
-  a.href = resultUrl.value;
   const base = (fileName.value || 'image').replace(/\.[^.]+$/, '');
-  a.download = `${base}_已去水印.png`;
+  const name = `${base}_已去水印.png`;
+  const a = document.createElement('a');
+  a.href = resultBlobUrl.value || resultUrl.value;
+  a.download = name;
+  // iOS 上 download 属性支持不好，改为新窗口打开让用户长按保存
+  if (isIOS) {
+    const w = window.open('', '_blank');
+    if (w) {
+      w.document.write(
+        `<title>${name}</title>`
+        + '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        + '<body style="margin:0;background:#0f1218;display:grid;place-items:center;min-height:100vh">'
+        + `<img src="${a.href}" style="max-width:100%;height:auto">`
+        + '<p style="color:#93a1b8;font:13px/1.6 -apple-system,sans-serif;text-align:center;padding:12px">'
+        + '长按这张图 → 选「存储图像」即可保存到相册</p></body>',
+      );
+      w.document.close();
+      tip('已在新页打开，长按图片保存到相册');
+      return;
+    }
+  }
   document.body.appendChild(a);
   a.click();
   a.remove();
-  tip('已开始下载；iPhone 可在下载项里长按保存到相册');
+  tip('已开始下载；若没反应请长按上方结果图保存');
 }
 
 function reset() {
+  if (resultBlobUrl.value) URL.revokeObjectURL(resultBlobUrl.value);
   srcImage.value = null; srcData.value = null; resultData.value = null;
-  resultUrl.value = ''; customMask.value = null; maskPx.value = 0;
+  resultUrl.value = ''; resultBlobUrl.value = ''; resultBlob.value = null;
+  customMask.value = null; maskPx.value = 0;
   fileName.value = ''; brushMode.value = false; splitPct.value = 50;
+  engine.value = ''; usedMask.value = null;
+  errText.value = '';
 }
 
 /* ---------------- 长按保存（移动端） ---------------- */
