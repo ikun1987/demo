@@ -1,7 +1,0 @@
-﻿node_modules/
-dist/
-libdist/
-e2e-out/
-maskdump/
-*.log
-.DS_Store
