@@ -1,0 +1,59 @@
+name: 部署网页版到 GitHub Pages
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: 安装依赖
+        run: npm ci --no-audit --no-fund
+
+      - name: 构建（base 设为仓库名，Pages 子路径必需）
+        env:
+          # Pages 地址是 https://<用户>.github.io/<仓库名>/，
+          # 所以 base 必须等于 /<仓库名>/，否则 JS/CSS 会 404
+          BASE: /${{ github.event.repository.name }}/
+        run: npm run build
+
+      - name: 关闭 Jekyll（否则下划线开头的文件会被吞掉）
+        run: touch dist/.nojekyll
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: web/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

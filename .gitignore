@@ -1,0 +1,29 @@
+# ---- 桌面版（Python/PyInstaller）构建产物，不入库 ----
+app/build/
+app/dist/
+dist/
+selftest/
+visual/
+*.spec.bak
+
+# 大模型权重（196MB，PyTorch 版；网页版走 CDN 不需要入库）
+app/assets/big-lama.pt
+
+# ---- 网页版 ----
+web/node_modules/
+web/dist/
+web/libdist/
+web/e2e-out/
+web/maskdump/
+webtools/node_modules/
+webtools/*.log
+
+# 中间产物
+web_model/
+__pycache__/
+*.pyc
+*.log
+
+# 临时/测试数据（体积小但没必要）
+testimages/*.jpg
+*.tmp
