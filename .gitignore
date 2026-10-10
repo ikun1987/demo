@@ -27,3 +27,11 @@ __pycache__/
 # 临时/测试数据（体积小但没必要）
 testimages/*.jpg
 *.tmp
+
+# 测试过程产生的图（体积大，不入库）
+web/fast-out/
+web/e2e-online/
+web/e2e-v2/
+webtools/e2e-online/
+webtools/*-out/
+*.log
